@@ -154,7 +154,6 @@ keystore = `
 }
 
 // Отправляем уведомление о том, что сертификат изменился
-// Значения беруться из аргументов командной строки
 func SendMailNotification(date, msg string) error {
 	toEmailAddress := recepient
 	var body string
