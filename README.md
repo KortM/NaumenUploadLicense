@@ -1,2 +1,2 @@
 # NaumenUploadLicense
-Обновление лицензии для helpdesk Naumen
+Обновление сертификата для helpdesk Naumen
