@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"database/sql"
 	"encoding/pem"
 	"fmt"
@@ -41,11 +42,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fileName, err = filepath.Abs(folder + "/cert.pem")
+	fileName, err = filepath.Abs(folder + "/cert.crt")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Пути для сертификата:\n%s\n%s\n", folder, fileName)
+	fmt.Printf("Путь для сертификата:\n%s\n", fileName)
 	configPath, err = filepath.Abs("config.cfg")
 	if err != nil {
 		log.Fatal(err)
@@ -56,8 +57,8 @@ func main() {
 	}
 	ParseConfig(configPath)
 	not_before, cert_name := GetCertDate()
-	WriteToDB(cert_name, *not_before)
 	CheckDate(cert_name, *not_before)
+
 }
 
 // Обновляем сертификат
@@ -71,11 +72,11 @@ func loadNewCert() error {
 		"-alias",
 		fmt.Sprintf("cert%d", time.Now().Year()),
 		"-file",
-		fmt.Sprintf("%s", fileName),
+		fileName,
 		"-keystore",
 		"/opt/naumen/svcNaumenADM/conf/naumen.keystore",
 		"-storepass",
-		fmt.Sprintf("%s", keystore),
+		keystore,
 	)
 	fmt.Println(cmd)
 	stderr, _ := cmd.StderrPipe()
@@ -137,7 +138,6 @@ keystore = `
 			log.Fatal("Не заполнено поле recepient в конфиг файле")
 		} else {
 			for _, line := range tmp {
-
 				recepient = append(recepient, strings.TrimSpace(line))
 			}
 		}
@@ -154,9 +154,7 @@ keystore = `
 }
 
 // Отправляем уведомление о том, что сертификат изменился
-// Значения беруться из аргументов командной строки
 func SendMailNotification(date, msg string) error {
-	toEmailAddress := recepient
 	var body string
 	subject := "Subject: Сертификат Naumen\r\n\r\n"
 	if len(msg) != 0 {
@@ -165,12 +163,42 @@ func SendMailNotification(date, msg string) error {
 		body += fmt.Sprintf("Обновился сертификат, актуальная дата: %s", date)
 	}
 	message := []byte(subject + body)
-
 	auth := smtp.PlainAuth("", email, passwd, server)
-	err := smtp.SendMail(server+":"+port, auth, email, toEmailAddress, message)
+	tlsconfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         server,
+	}
+	conn, err := tls.Dial("tcp", server+":"+port, tlsconfig)
 	if err != nil {
 		return err
 	}
+	c, err := smtp.NewClient(conn, server)
+	if err != nil {
+		return err
+	}
+	if err = c.Auth(auth); err != nil {
+		return err
+	}
+	if err = c.Mail(email); err != nil {
+		return err
+	}
+	for _, recepient := range recepient {
+		if err = c.Rcpt(recepient); err != nil {
+			return err
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(message)
+	if err != nil {
+		return err
+	}
+	if err = w.Close(); err != nil {
+		return err
+	}
+	c.Quit()
 	return nil
 }
 
@@ -236,6 +264,9 @@ func WriteToDB(name string, date time.Time) {
 	//Создаем таблицу
 	_, _ = db.Exec("CREATE TABLE certs(id INTEGER PRIMARY KEY, name TEXT, date TEXT);")
 	rows, err := db.Query("SELECT * FROM certs;")
+	if err != nil {
+		fmt.Println(err)
+	}
 	defer rows.Close()
 
 	if !rows.Next() {
@@ -264,39 +295,43 @@ func CheckDate(name string, d time.Time) {
 	query := fmt.Sprintf("SELECT * FROM certs WHERE name LIKE \"%s\";", name)
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			id   int
-			name string
-			date string
-		)
-		err = rows.Scan(&id, &name, &date)
-		if err != nil {
-			log.Fatal(err)
+		fmt.Println(err)
+		if err = loadNewCert(); err != nil {
+			fmt.Println("Не удалось обновить сертификат!", err)
+			if err = SendMailNotification(d.String(), fmt.Sprintf("Не удалось обновить сертификат! %s", err)); err != nil {
+				log.Fatal("Отправить сообщение не удалось! ", err)
+			}
+		} else {
+			WriteToDB(name, d)
 		}
-		t := fmt.Sprintf("%s", d)
-		if date == t {
-			//fmt.Println("NOT EQUALS")
-			err = loadNewCert()
-			if err != nil {
-				fmt.Println(err)
-				err = SendMailNotification(t, "Дата выпуска сертификата изменилась, но обновить сертификат не удалось!")
-				if err != nil {
-					log.Fatal("Обновление сертификата не удалось! Ошибка при отправке сообщения.\n", err)
+	} else {
+		for rows.Next() {
+			var (
+				id   int
+				name string
+				date string
+			)
+			if err = rows.Scan(&id, &name, &date); err != nil {
+				log.Fatal(err)
+			}
+			t := fmt.Sprintf("%s", d)
+			if date != t {
+				if err = loadNewCert(); err != nil {
+					fmt.Println("Дата выпуска сертификата изменилась, но обновить сертификат не удалось!", err)
+					if err = SendMailNotification(d.String(), fmt.Sprintf("Дата выпуска сертификата изменилась, но обновить сертификат не удалось! %s", err)); err != nil {
+						fmt.Println("Отправить сообщение не удалось", err)
+					}
+				} else {
+					if err = SendMailNotification(t, ""); err != nil {
+						log.Fatal("Сертификат обновлен! Требуется перезагрузка. Отправка уведомления не удалось. ", err)
+					}
+					deletePrevValue(name)
+					WriteToDB(name, d)
 				}
 			} else {
-				err = SendMailNotification(t, "")
-				if err != nil {
-					log.Fatal("Сертификат обновлен! Требуется перезагрузка. Отправка уведомления не удалось. ", err)
-				}
-				deletePrevValue(name)
-				WriteToDB(name, d)
+				fmt.Fprintf(os.Stdout, "На текущий момент установлена актуальная версия сертификата: %s %s\n", name, date)
 			}
 		}
-		fmt.Fprintf(os.Stdout, "На текущий момент установлена актуальная версия сертификата: %s %s\n", name, date)
 	}
 }
 
